@@ -358,6 +358,13 @@ def make_preview(take_id):
 # START
 # =========================================================
 
+async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"ID этого чата: `{update.effective_chat.id}`",
+        parse_mode="Markdown"
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
@@ -1035,7 +1042,13 @@ def main():
     app.add_handler(
         CallbackQueryHandler(button_handler)
     )
+app.add_handler(
+    CommandHandler("start", start)
+)
 
+app.add_handler(
+    CommandHandler("id", chat_id)
+)
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
