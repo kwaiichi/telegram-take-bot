@@ -1,8 +1,14 @@
 import os
 import logging
 import html
+import asyncio
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -12,19 +18,21 @@ from telegram.ext import (
     filters,
 )
 
+
 # =========================================================
 # НАСТРОЙКИ
 # =========================================================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# Чат, куда будут приходить тейки на модерацию
-MODERATION_CHAT_ID = os.environ.get("MODERATION_CHAT_ID", "")
+# ID чата модерации.
+# Добавим его в Railway Variables после получения через /id.
+MODERATION_CHAT_ID = os.environ.get("MODERATION_CHAT_ID", "").strip()
 
-# Чат, куда публикуются одобренные тейки
-CHAT_ID = os.environ.get("CHAT_ID", "")
+# Максимум фотографий на один тейк
+MAX_PHOTOS = 10
 
-# Подпись после хэштегов
+# Подпись
 BOT_SIGNATURE = "| @uslujestvokfbot"
 
 
@@ -196,11 +204,16 @@ TAG_WORDS = {
 # =========================================================
 
 takes = {}
+active_takes = {}
 take_counter = 0
+
+# Для сбора Telegram-альбомов
+album_buffers = {}
+album_tasks = {}
 
 
 # =========================================================
-# ПОДБОР ХЭШТЕГОВ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =========================================================
 
 def suggest_hashtags(text):
@@ -216,12 +229,18 @@ def suggest_hashtags(text):
     return suggestions
 
 
-# =========================================================
-# ФИНАЛЬНЫЙ ТЕКСТ
-# =========================================================
+def make_author_link(take):
+    name = html.escape(take["full_name"])
+
+    return (
+        f'<a href="tg://user?id={take["user_id"]}">'
+        f'{name}'
+        f'</a>'
+    )
+
 
 def make_publication_text(take):
-    text = html.escape(take["text"])
+    text = html.escape(take["text"].strip())
     hashtags = " ".join(take["hashtags"])
 
     parts = []
@@ -229,35 +248,140 @@ def make_publication_text(take):
     if text:
         parts.append(text)
 
+    # ВАЖНО:
+    # подпись находится СРАЗУ ПОСЛЕ хэштегов
     if hashtags:
-        parts.append(hashtags)
+        parts.append(
+            f"{hashtags} {html.escape(BOT_SIGNATURE)}"
+        )
+    else:
+        parts.append(
+            html.escape(BOT_SIGNATURE)
+        )
 
-    parts.append(html.escape(BOT_SIGNATURE))
+    # Автор тоже будет виден в тейке
+    parts.append(
+        f"👤 Автор: {make_author_link(take)}"
+    )
 
     return "\n\n".join(parts)
 
 
-# =========================================================
-# АВТОР
-# =========================================================
+def make_take_id():
+    global take_counter
 
-def make_author_link(take):
-    name = take["full_name"]
-
-    return (
-        f'<a href="tg://user?id={take["user_id"]}">'
-        f'{html.escape(name)}'
-        f'</a>'
-    )
+    take_counter += 1
+    return take_counter
 
 
+def get_take(take_id):
+    return takes.get(take_id)
+
+
+def create_take(update, text="", photos=None):
+    user = update.effective_user
+
+    if photos is None:
+        photos = []
+
+    take_id = make_take_id()
+
+    takes[take_id] = {
+        "text": text.strip(),
+        "hashtags": suggest_hashtags(text),
+        "user_id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "photos": photos[:MAX_PHOTOS],
+        "state": "draft",
+        "status": "draft",
+    }
+
+    active_takes[user.id] = take_id
+
+    return take_id
+
+
 # =========================================================
-# КЛАВИАТУРА ХЭШТЕГОВ
+# КЛАВИАТУРЫ
 # =========================================================
+
+def photo_choice_keyboard(take_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📷 Добавить картинки",
+                callback_data=f"addphotos:{take_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "➡️ Без картинок",
+                callback_data=f"nophotos:{take_id}"
+            )
+        ]
+    ])
+
+
+def photo_actions_keyboard(take_id):
+    take = get_take(take_id)
+
+    buttons = []
+
+    if take and len(take["photos"]) < MAX_PHOTOS:
+        buttons.append([
+            InlineKeyboardButton(
+                "📷 Добавить ещё",
+                callback_data=f"addmore:{take_id}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "✏️ Добавить текст",
+            callback_data=f"addtext:{take_id}"
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "➡️ Без текста",
+            callback_data=f"notext:{take_id}"
+        )
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def waiting_photos_keyboard(take_id):
+    take = get_take(take_id)
+
+    buttons = []
+
+    if len(take["photos"]) < MAX_PHOTOS:
+        buttons.append([
+            InlineKeyboardButton(
+                "📷 Добавить ещё",
+                callback_data=f"addmore:{take_id}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "✅ Готово",
+            callback_data=f"photosdone:{take_id}"
+        )
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
 
 def hashtag_keyboard(take_id):
+    take = get_take(take_id)
 
-    take = takes[take_id]
+    if not take:
+        return InlineKeyboardMarkup([])
+
     selected = take["hashtags"]
 
     buttons = []
@@ -284,6 +408,14 @@ def hashtag_keyboard(take_id):
     if row:
         buttons.append(row)
 
+    if len(take["photos"]) < MAX_PHOTOS:
+        buttons.append([
+            InlineKeyboardButton(
+                "📷 Добавить фото",
+                callback_data=f"addmore:{take_id}"
+            )
+        ])
+
     buttons.append([
         InlineKeyboardButton(
             "✅ Готово",
@@ -294,17 +426,18 @@ def hashtag_keyboard(take_id):
     return InlineKeyboardMarkup(buttons)
 
 
-# =========================================================
-# КНОПКИ
-# =========================================================
-
 def preview_keyboard(take_id):
-
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "✏️ Изменить хэштеги",
                 callback_data=f"edit:{take_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📷 Добавить фото",
+                callback_data=f"addmore:{take_id}"
             )
         ],
         [
@@ -323,11 +456,10 @@ def preview_keyboard(take_id):
 
 
 def moderation_keyboard(take_id):
-
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "✅ ОПУБЛИКОВАТЬ",
+                "✅ ОДОБРИТЬ",
                 callback_data=f"approve:{take_id}"
             ),
             InlineKeyboardButton(
@@ -343,14 +475,16 @@ def moderation_keyboard(take_id):
 # =========================================================
 
 def make_preview(take_id):
-
-    take = takes[take_id]
+    take = get_take(take_id)
 
     publication = make_publication_text(take)
 
+    photo_count = len(take["photos"])
+
     return (
-        "👀 <b>Предпросмотр тейка:</b>\n\n"
-        f"{publication}"
+        "👀 <b>Предпросмотр тейка</b>\n\n"
+        f"{publication}\n\n"
+        f"📎 Фотографий: {photo_count}/{MAX_PHOTOS}"
     )
 
 
@@ -358,62 +492,83 @@ def make_preview(take_id):
 # START
 # =========================================================
 
-async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if update.effective_chat.type != "private":
+        return
+
     await update.message.reply_text(
-        f"ID этого чата: `{update.effective_chat.id}`",
+        "Привет!\n\n"
+        "Отправь мне свой тейк текстом или "
+        "фотографии с подписью.\n\n"
+        "Можно добавить до 10 фотографий.\n"
+        "После этого бот предложит хэштеги "
+        "и отправит готовый тейк на модерацию."
+    )
+
+
+# =========================================================
+# CANCEL
+# =========================================================
+
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if update.effective_chat.type != "private":
+        return
+
+    user_id = update.effective_user.id
+    take_id = active_takes.get(user_id)
+
+    if take_id:
+        takes.pop(take_id, None)
+        active_takes.pop(user_id, None)
+
+        await update.message.reply_text(
+            "Текущий тейк отменён."
+        )
+    else:
+        await update.message.reply_text(
+            "У тебя сейчас нет активного тейка."
+        )
+
+
+# =========================================================
+# ID ЧАТА
+# =========================================================
+
+async def chat_id(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat = update.effective_chat
+
+    await update.effective_message.reply_text(
+        f"ID этого чата:\n`{chat.id}`\n\n"
+        f"Тип: `{chat.type}`",
         parse_mode="Markdown"
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "Привет!\n\n"
-        "Это бот для тейков. Сюда можно отправить "
-        "текст или фотографию с подписью.\n\n"
-        "После этого выберите хэштеги и отправьте тейк "
-        "на модерацию.\n\n"
-        "Публикация осуществляется в течение 24 часов."
-    )
-
-
 # =========================================================
-# СОЗДАНИЕ ТЕЙКА
+# ТЕКСТ
 # =========================================================
 
-def create_take(update, text, photo_id=None):
-
-    global take_counter
-
-    take_counter += 1
-    take_id = take_counter
-
-    user = update.effective_user
-
-    suggestions = suggest_hashtags(text)
-
-    takes[take_id] = {
-        "text": text,
-        "hashtags": suggestions,
-        "user_id": user.id,
-        "username": user.username,
-        "full_name": user.full_name,
-        "photo_id": photo_id,
-    }
-
-    return take_id, suggestions
-
-
-# =========================================================
-# ТЕКСТОВЫЙ ТЕЙК
-# =========================================================
-
-async def receive_text_take(
+async def receive_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
     if not update.message or not update.message.text:
+        return
+
+    # Тейки принимаем только в личке с ботом.
+    # Иначе сообщения модераторов в группе будут
+    # случайно восприниматься как тейки.
+    if update.effective_chat.type != "private":
         return
 
     text = update.message.text.strip()
@@ -430,32 +585,53 @@ async def receive_text_take(
         )
         return
 
-    take_id, suggestions = create_take(
-        update,
-        text
-    )
+    user_id = update.effective_user.id
+    active_id = active_takes.get(user_id)
 
-    if suggestions:
-        message = (
-            "Я автоматически подобрал хэштеги.\n"
-            "Можешь убрать или добавить нужные:"
-        )
-    else:
-        message = (
-            "Выбери подходящие хэштеги для тейка:"
-        )
+    # Если бот уже ждёт текст для фото
+    if active_id:
+        take = get_take(active_id)
+
+        if take and take["state"] == "waiting_text":
+            take["text"] = text
+            take["hashtags"] = suggest_hashtags(text)
+            take["state"] = "hashtags"
+
+            await update.message.reply_text(
+                "Отлично! Теперь выбери хэштеги:",
+                reply_markup=hashtag_keyboard(active_id)
+            )
+            return
+
+        # Если уже есть активный незавершённый тейк
+        if take and take["state"] not in (
+            "submitted",
+            "approved",
+            "rejected",
+        ):
+            await update.message.reply_text(
+                "У тебя уже есть незавершённый тейк 😭\n"
+                "Закончи его или используй /cancel."
+            )
+            return
+
+    take_id = create_take(
+        update,
+        text=text,
+        photos=[]
+    )
 
     await update.message.reply_text(
-        message,
-        reply_markup=hashtag_keyboard(take_id)
+        "Хотите добавить картинку?",
+        reply_markup=photo_choice_keyboard(take_id)
     )
 
 
 # =========================================================
-# ФОТО
+# ОБРАБОТКА ФОТО
 # =========================================================
 
-async def receive_photo_take(
+async def receive_photo(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -463,563 +639,631 @@ async def receive_photo_take(
     if not update.message or not update.message.photo:
         return
 
-    photo = update.message.photo[-1]
+    if update.effective_chat.type != "private":
+        return
 
-    caption = (
-        update.message.caption.strip()
-        if update.message.caption
-        else ""
+    message = update.message
+    user_id = update.effective_user.id
+
+    # Telegram отправляет альбом как несколько отдельных сообщений
+    # с одинаковым media_group_id.
+    if message.media_group_id:
+
+        key = (user_id, message.media_group_id)
+
+        if key not in album_buffers:
+            album_buffers[key] = []
+
+        album_buffers[key].append(message)
+
+        # Перезапускаем таймер сбора альбома
+        old_task = album_tasks.get(key)
+
+        if old_task:
+            old_task.cancel()
+
+        album_tasks[key] = asyncio.create_task(
+            process_album_after_delay(
+                key,
+                context
+            )
+        )
+
+        return
+
+    # Одиночное фото
+    await process_photo_batch(
+        [message],
+        context
     )
+
+
+async def process_album_after_delay(
+    key,
+    context
+):
+
+    try:
+        # Ждём, пока Telegram пришлёт остальные фотографии альбома.
+        await asyncio.sleep(1.2)
+
+        messages = album_buffers.pop(key, [])
+
+        album_tasks.pop(key, None)
+
+        if messages:
+            messages.sort(key=lambda x: x.message_id)
+
+            await process_photo_batch(
+                messages,
+                context
+            )
+
+    except asyncio.CancelledError:
+        return
+
+
+async def process_photo_batch(
+    messages,
+    context
+):
+
+    if not messages:
+        return
+
+    first_message = messages[0]
+    user = first_message.from_user
+    user_id = user.id
+
+    # Собираем file_id фотографий
+    photos = []
+
+    for message in messages:
+        if not message.photo:
+            continue
+
+        photos.append(
+            message.photo[-1].file_id
+        )
+
+    # Берём подпись из первого сообщения альбома,
+    # где она есть.
+    caption = ""
+
+    for message in messages:
+        if message.caption:
+            caption = message.caption.strip()
+            break
 
     if len(caption) > 4000:
-        await update.message.reply_text(
-            "Подпись к фотографии слишком длинная. "
-            "Максимум     ],
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "Подпись слишком длинная. "
+                "Максимум 4000 символов."
+            )
+        )
+        return
 
-    "#сигны": [
-        "сигн", "сигны", "подпись",
-        "подписи", "sign", "signs",
-    ],
+    active_id = active_takes.get(user_id)
+    take = get_take(active_id) if active_id else None
 
-    "#нфт": [
-        "nft", "нфт", "токен", "токены",
-    ],
+    # -----------------------------------------------------
+    # НЕТ АКТИВНОГО ТЕЙКА
+    # -----------------------------------------------------
 
-    "#адопты": [
-        "адопт", "адопты", "adopt", "adopts",
-        "персонаж на усыновление",
-    ],
+    if not take:
 
-    "#эдиты": [
-        "эдит", "эдиты", "edit", "edits",
-        "монтаж", "монтажи", "видео монтаж",
-    ],
+        photos = photos[:MAX_PHOTOS]
 
-    "#прокачки": [
-        "прокачка", "прокачки", "прокачаю",
-        "прокачать", "фарм", "фарма",
-    ],
+        take_id = create_take(
+            first_message,
+            text=caption,
+            photos=photos
+        )
 
-    "#игры": [
-        "игра", "игры", "игровой",
-        "игровые", "minecraft", "геншин",
-        "genshin", "roblox",
-    ],
+        take = get_take(take_id)
 
-    "#оформления": [
-        "оформление", "оформления", "оформлю",
-        "дизайн", "дизайны", "профильное оформление",
-    ],
+        # Фото + подпись -> сразу хэштеги
+        if caption:
+            take["state"] = "hashtags"
 
-    "#писательство": [
-        "писательство", "пишу", "напишу",
-        "тексты", "текст", "статья",
-        "статьи", "фанфик", "фанфики",
-    ],
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"Получил {len(photos)} "
+                    f"фото.\n\n"
+                    "Я автоматически подобрал хэштеги. "
+                    "Можешь изменить их:"
+                ),
+                reply_markup=hashtag_keyboard(take_id)
+            )
 
-    "#репетиторство": [
-        "репетитор", "репетиторство", "уроки",
-        "занятия", "обучу", "обучение",
-        "преподаю",
-    ],
-
-    "#админство": [
-        "админ", "админы", "админство",
-        "администратор", "администраторы",
-        "модератор", "модераторы",
-        "модерация",
-    ],
-
-    "#учёба": [
-        "учёба", "учеба", "учусь",
-        "домашка", "домашнее задание",
-        "студент", "студенты",
-    ],
-
-    "#одежда": [
-        "одежда", "одежду", "одежды",
-        "футболка", "футболки", "худи",
-        "худи", "штаны", "платье",
-    ],
-
-    "#рукоделие": [
-        "рукоделие", "ручная работа",
-        "сделаю руками", "вязание", "шитьё",
-        "шитье", "вышивка", "лепка",
-        "украшения ручной работы",
-    ],
-
-    "#пиар": [
-        "пиар", "реклама", "рекламу",
-        "продвижение", "продвину",
-        "рекламировать", "раскрутка",
-    ],
-
-    "#бусты": [
-        "буст", "бусты", "бустинг",
-        "поднять уровень", "подниму уровень",
-    ],
-}
-
-
-# =========================================================
-# ВРЕМЕННОЕ ХРАНИЛИЩЕ ТЕЙКОВ
-# =========================================================
-
-takes = {}
-take_counter = 0
-
-
-# =========================================================
-# ПОДБОР ХЭШТЕГОВ
-# =========================================================
-
-def suggest_hashtags(text):
-    text_lower = text.lower()
-
-    suggestions = []
-
-    for tag, words in TAG_WORDS.items():
-        for word in words:
-            if word in text_lower:
-                suggestions.append(tag)
-                break
-
-    # Если ничего подходящего не нашли,
-    # предлагаем человеку выбрать самому.
-    return suggestions
-
-
-# =========================================================
-# КЛАВИАТУРА ХЭШТЕГОВ
-# =========================================================
-
-def hashtag_keyboard(take_id):
-    take = takes[take_id]
-    selected = take["hashtags"]
-
-    buttons = []
-    row = []
-
-    for tag in HASHTAGS:
-
-        if tag in selected:
-            text = f"☑️ {tag}"
+        # Только фото -> спрашиваем про текст
         else:
-            text = f"☐ {tag}"
+            take["state"] = "waiting_text_choice"
 
-        row.append(
-            InlineKeyboardButton(
-                text,
-                callback_data=f"tag:{take_id}:{tag}"
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"Получил {len(photos)} "
+                    f"фото.\n\n"
+                    "Хотите добавить текст к тейку?"
+                ),
+                reply_markup=photo_actions_keyboard(take_id)
             )
-        )
 
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-
-    if row:
-        buttons.append(row)
-
-    buttons.append([
-        InlineKeyboardButton(
-            "✅ Готово",
-            callback_data=f"done:{take_id}"
-        )
-    ])
-
-    return InlineKeyboardMarkup(buttons)
-
-
-# =========================================================
-# КНОПКИ ПРЕДПРОСМОТРА
-# =========================================================
-
-def preview_keyboard(take_id):
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✏️ Изменить хэштеги",
-                callback_data=f"edit:{take_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📨 Отправить на модерацию",
-                callback_data=f"send:{take_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ Отменить",
-                callback_data=f"cancel:{take_id}"
-            )
-        ]
-    ])
-
-
-# =========================================================
-# ТЕКСТ ПРЕДПРОСМОТРА
-# =========================================================
-
-def make_preview(take_id):
-
-    take = takes[take_id]
-
-    text = html.escape(take["text"])
-    hashtags = " ".join(take["hashtags"])
-
-    if hashtags:
-        return (
-            "👀 <b>Предпросмотр тейка:</b>\n\n"
-            f"{text}\n\n"
-            f"{hashtags}"
-        )
-
-    return (
-        "👀 <b>Предпросмотр тейка:</b>\n\n"
-        f"{text}\n\n"
-        "<i>Хэштеги не выбраны.</i>"
-    )
-
-
-# =========================================================
-# START
-# =========================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    text = (
-        "Привет!\n\n"
-        "Это бот для тейков. Сюда вы можете скинуть свой "
-        "тейк, который сразу же рассмотрит модерация.\n\n"
-        "Публикация осуществляется в течение 24 часов. "
-        "Если прошло больше, пожалуйста, продублируйте тейк!\n\n"
-        "Отправьте свой тейк следующим сообщением."
-    )
-
-    await update.message.reply_text(text)
-
-
-# =========================================================
-# ПОЛУЧЕНИЕ ТЕЙКА
-# =========================================================
-
-async def receive_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    global take_counter
-
-    if not update.message or not update.message.text:
         return
 
-    text = update.message.text.strip()
+    # -----------------------------------------------------
+    # ЕСТЬ АКТИВНЫЙ ТЕЙК
+    # -----------------------------------------------------
 
-    if len(text) < 2:
-        await update.message.reply_text(
-            "Тейк слишком короткий 😭"
+    # Добавляем фотографии к существующему тейку
+    current_count = len(take["photos"])
+    available = MAX_PHOTOS - current_count
+
+    if available <= 0:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="⚠️ У тебя уже максимальные 10 фотографий."
         )
         return
 
-    if len(text) > 4000:
-        await update.message.reply_text(
-            "Тейк слишком длинный. Пожалуйста, сократите его "
-            "до 4000 символов."
+    photos_to_add = photos[:available]
+
+    take["photos"].extend(photos_to_add)
+
+    # Если фотографий оказалось больше лимита
+    if len(photos) > available:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="⚠️ Максимум 10 фотографий. Лишние фото не добавлены."
         )
+
+    # Если подпись пришла вместе с фото и текста ещё нет,
+    # используем её как текст.
+    if caption and not take["text"]:
+        take["text"] = caption
+        take["hashtags"] = suggest_hashtags(caption)
+
+    # Если ждём фотографии после текстового тейка
+    if take["state"] in (
+        "waiting_photos",
+        "waiting_photo_choice",
+        "waiting_text_choice",
+        "draft",
+    ):
+
+        # Если уже есть текст -> просто продолжаем с фото
+        if take["text"]:
+            take["state"] = "waiting_photos"
+
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"Добавлено фотографий: "
+                    f"{len(take['photos'])}/{MAX_PHOTOS}\n\n"
+                    "Когда закончишь, нажми «Готово»."
+                ),
+                reply_markup=waiting_photos_keyboard(active_id)
+            )
+
+        else:
+            take["state"] = "waiting_text_choice"
+
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"Добавлено фотографий: "
+                    f"{len(take['photos'])}/{MAX_PHOTOS}\n\n"
+                    "Хотите добавить текст?"
+                ),
+                reply_markup=photo_actions_keyboard(active_id)
+            )
+
         return
 
-    take_counter += 1
-    take_id = take_counter
+    # Если пользователь добавляет фото уже на этапе хэштегов
+    if take["state"] == "hashtags":
 
-    suggestions = suggest_hashtags(text)
-
-    takes[take_id] = {
-        "text": text,
-        "hashtags": suggestions,
-        "user_id": update.effective_user.id,
-        "username": update.effective_user.username,
-    }
-
-    if suggestions:
-        message = (
-            "Я подобрал несколько хэштегов автоматически.\n"
-            "Вы можете убрать их или добавить другие:"
-        )
-    else:
-        message = (
-            "Выберите подходящие хэштеги для вашего тейка:"
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"Добавлено фотографий: "
+                f"{len(take['photos'])}/{MAX_PHOTOS}\n\n"
+                "Хэштеги остаются прежними:"
+            ),
+            reply_markup=hashtag_keyboard(active_id)
         )
 
-    await update.message.reply_text(
-        message,
-        reply_markup=hashtag_keyboard(take_id)
-    )
+        return
+
+    # Если добавляем фото из предпросмотра
+    if take["state"] == "preview":
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=make_preview(active_id),
+            parse_mode="HTML",
+            reply_markup=preview_keyboard(active_id)
+        )
 
 
 # =========================================================
-# ОБРАБОТКА INLINE-КНОПОК
+# CALLBACKS
 # =========================================================
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callbacks(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     query = update.callback_query
 
-    data = query.data.split(":", 2)
+    await query.answer()
 
-    action = data[0]
-    take_id = int(data[1])
+    data = query.data
 
-    # Тейк уже удалён
-    if take_id not in takes:
-        await query.answer(
-            "Этот тейк уже обработан.",
-            show_alert=True
+    try:
+        action, take_id_str, *extra = data.split(":")
+        take_id = int(take_id_str)
+    except (ValueError, AttributeError):
+        return
+
+    take = get_take(take_id)
+
+    if not take:
+        await query.edit_message_text(
+            "Этот тейк больше не существует."
         )
         return
 
-    take = takes[take_id]
+    user_id = query.from_user.id
 
     # =====================================================
-    # ВЫБОР ХЭШТЕГА
+    # ДЕЙСТВИЯ АВТОРА
     # =====================================================
 
-    if action == "tag":
+    if action not in ("approve", "reject"):
 
-        # Выбирать хэштеги может только автор тейка
-        if query.from_user.id != take["user_id"]:
+        if take["user_id"] != user_id:
             await query.answer(
-                "Это не ваш тейк.",
+                "Это не твой тейк.",
                 show_alert=True
             )
             return
 
-        tag = data[2]
+    # -----------------------------------------------------
+    # ДОБАВИТЬ ФОТО
+    # -----------------------------------------------------
+
+    if action in ("addphotos", "addmore"):
+
+        if len(take["photos"]) >= MAX_PHOTOS:
+            await query.answer(
+                "Уже добавлено 10 фотографий.",
+                show_alert=True
+            )
+            return
+
+        take["state"] = "waiting_photos"
+
+        await query.edit_message_text(
+            (
+                f"Отправь фотографии.\n\n"
+                f"Сейчас: {len(take['photos'])}/{MAX_PHOTOS}\n"
+                "Можно отправить альбомом."
+            ),
+            reply_markup=waiting_photos_keyboard(take_id)
+        )
+        return
+
+    # -----------------------------------------------------
+    # БЕЗ ФОТО
+    # -----------------------------------------------------
+
+    if action == "nophotos":
+
+        take["state"] = "hashtags"
+
+        await query.edit_message_text(
+            "Хорошо. Теперь выбери хэштеги:",
+            reply_markup=hashtag_keyboard(take_id)
+        )
+        return
+
+    # -----------------------------------------------------
+    # ДОБАВИТЬ ТЕКСТ
+    # -----------------------------------------------------
+
+    if action == "addtext":
+
+        take["state"] = "waiting_text"
+
+        await query.edit_message_text(
+            "Напиши текст для тейка:"
+        )
+        return
+
+    # -----------------------------------------------------
+    # БЕЗ ТЕКСТА
+    # -----------------------------------------------------
+
+    if action == "notext":
+
+        take["text"] = ""
+        take["hashtags"] = []
+        take["state"] = "hashtags"
+
+        await query.edit_message_text(
+            "Хорошо. Теперь выбери хэштеги:",
+            reply_markup=hashtag_keyboard(take_id)
+        )
+        return
+
+    # -----------------------------------------------------
+    # ГОТОВО С ФОТО
+    # -----------------------------------------------------
+
+    if action == "photosdone":
+
+        if not take["photos"]:
+            await query.answer(
+                "Добавь хотя бы одну фотографию.",
+                show_alert=True
+            )
+            return
+
+        take["state"] = "hashtags"
+
+        await query.edit_message_text(
+            "Теперь выбери хэштеги:",
+            reply_markup=hashtag_keyboard(take_id)
+        )
+        return
+
+    # -----------------------------------------------------
+    # ХЭШТЕГ
+    # -----------------------------------------------------
+
+    if action == "tag":
+
+        if not extra:
+            return
+
+        tag = extra[0]
 
         if tag in take["hashtags"]:
             take["hashtags"].remove(tag)
         else:
             take["hashtags"].append(tag)
 
-        await query.answer()
-
         await query.edit_message_reply_markup(
             reply_markup=hashtag_keyboard(take_id)
         )
-
         return
 
-    # =====================================================
-    # ГОТОВО
-    # =====================================================
+    # -----------------------------------------------------
+    # ГОТОВО С ХЭШТЕГАМИ
+    # -----------------------------------------------------
 
     if action == "done":
 
-        if query.from_user.id != take["user_id"]:
-            await query.answer(
-                "Это не ваш тейк.",
-                show_alert=True
-            )
-            return
-
-        await query.answer()
+        take["state"] = "preview"
 
         await query.edit_message_text(
             make_preview(take_id),
             parse_mode="HTML",
             reply_markup=preview_keyboard(take_id)
         )
-
         return
 
-    # =====================================================
+    # -----------------------------------------------------
     # ИЗМЕНИТЬ ХЭШТЕГИ
-    # =====================================================
+    # -----------------------------------------------------
 
     if action == "edit":
 
-        if query.from_user.id != take["user_id"]:
-            await query.answer(
-                "Это не ваш тейк.",
-                show_alert=True
-            )
-            return
-
-        await query.answer()
+        take["state"] = "hashtags"
 
         await query.edit_message_text(
-            "Выберите подходящие хэштеги:",
+            "Измени хэштеги:",
             reply_markup=hashtag_keyboard(take_id)
         )
-
         return
 
-    # =====================================================
+    # -----------------------------------------------------
     # ОТМЕНИТЬ
-    # =====================================================
+    # -----------------------------------------------------
 
     if action == "cancel":
 
-        if query.from_user.id != take["user_id"]:
-            await query.answer(
-                "Это не ваш тейк.",
-                show_alert=True
-            )
-            return
+        takes.pop(take_id, None)
 
-        del takes[take_id]
-
-        await query.answer()
+        if active_takes.get(user_id) == take_id:
+            active_takes.pop(user_id, None)
 
         await query.edit_message_text(
-            "❌ Тейк отменён."
+            "Тейк отменён."
         )
-
         return
 
     # =====================================================
-    # ОТПРАВИТЬ МОДЕРАЦИИ
+    # ОТПРАВКА НА МОДЕРАЦИЮ
     # =====================================================
 
     if action == "send":
 
-        if query.from_user.id != take["user_id"]:
+        if not MODERATION_CHAT_ID:
             await query.answer(
-                "Это не ваш тейк.",
+                "MODERATION_CHAT_ID ещё не настроен.",
                 show_alert=True
             )
             return
 
-        hashtags = " ".join(take["hashtags"])
+        take["state"] = "submitted"
+        take["status"] = "pending"
 
-        escaped_text = html.escape(take["text"])
+        publication = make_publication_text(take)
 
-        if hashtags:
-            take_content = (
-                f"{escaped_text}\n\n"
-                f"{hashtags}"
-            )
-        else:
-            take_content = escaped_text
-
-        moderator_text = (
-            f"📨 <b>Новый тейк #{take_id}</b>\n\n"
-            f"{take_content}\n\n"
-            f"👤 Автор: скрыт"
+        moderation_text = (
+            "📨 <b>НОВЫЙ ТЕЙК</b>\n\n"
+            f"{publication}\n\n"
+            f"📎 Фотографий: {len(take['photos'])}/{MAX_PHOTOS}"
         )
-
-        moderator_keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ ОПУБЛИКОВАТЬ",
-                    callback_data=f"approve:{take_id}"
-                ),
-                InlineKeyboardButton(
-                    "❌ ОТКЛОНИТЬ",
-                    callback_data=f"reject:{take_id}"
-                )
-            ]
-        ])
-
-        await context.bot.send_message(
-            chat_id=MODERATOR_ID,
-            text=moderator_text,
-            parse_mode="HTML",
-            reply_markup=moderator_keyboard
-        )
-
-        await query.answer()
-
-        await query.edit_message_text(
-            "📨 Тейк отправлен на модерацию!\n\n"
-            "Если он пройдёт модерацию, его опубликуют "
-            "в течение 24 часов."
-        )
-
-        return
-
-    # =====================================================
-    # ДАЛЬШЕ ТОЛЬКО МОДЕРАТОР
-    # =====================================================
-
-    if query.from_user.id != MODERATOR_ID:
-        await query.answer(
-            "У вас нет доступа к этой функции.",
-            show_alert=True
-        )
-        return
-
-    # =====================================================
-    # ОПУБЛИКОВАТЬ
-    # =====================================================
-
-    if action == "approve":
-
-        if not CHAT_ID:
-            await query.answer(
-                "CHAT_ID КФ ещё не настроен.",
-                show_alert=True
-            )
-            return
-
-        hashtags = " ".join(take["hashtags"])
-        escaped_text = html.escape(take["text"])
-
-        if hashtags:
-            publication = (
-                f"{escaped_text}\n\n"
-                f"{hashtags}"
-            )
-        else:
-            publication = escaped_text
 
         try:
 
+            # Отправляем фотографии в чат модерации
+            if take["photos"]:
+
+                if len(take["photos"]) == 1:
+
+                    await context.bot.send_photo(
+                        chat_id=MODERATION_CHAT_ID,
+                        photo=take["photos"][0]
+                    )
+
+                else:
+
+                    media = [
+                        InputMediaPhoto(
+                            media=photo_id
+                        )
+                        for photo_id in take["photos"]
+                    ]
+
+                    await context.bot.send_media_group(
+                        chat_id=MODERATION_CHAT_ID,
+                        media=media
+                    )
+
+            # Отдельным сообщением отправляем текст
+            # и кнопки модерации.
             await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=publication,
+                chat_id=MODERATION_CHAT_ID,
+                text=moderation_text,
+                parse_mode="HTML",
+                reply_markup=moderation_keyboard(take_id)
+            )
+
+            active_takes.pop(user_id, None)
+
+            await query.edit_message_text(
+                "✅ Тейк отправлен на модерацию!\n\n"
+                "Теперь дождись решения модераторов."
+            )
+
+        except Exception as e:
+
+            logging.exception(
+                "Ошибка отправки в чат модерации"
+            )
+
+            take["state"] = "preview"
+            take["status"] = "draft"
+
+            await query.answer(
+                "Не получилось отправить тейк в чат модерации.",
+                show_alert=True
+            )
+
+        return
+
+    # =====================================================
+    # ПРОВЕРКА МОДЕРАТОРА
+    # =====================================================
+
+    if action in ("approve", "reject"):
+
+        if not MODERATION_CHAT_ID:
+            await query.answer(
+                "MODERATION_CHAT_ID не настроен.",
+                show_alert=True
+            )
+            return
+
+        # Проверяем, является ли человек администратором
+        # чата модерации.
+        try:
+
+            member = await context.bot.get_chat_member(
+                chat_id=MODERATION_CHAT_ID,
+                user_id=user_id
+            )
+
+            if member.status not in (
+                "administrator",
+                "creator",
+            ):
+                await query.answer(
+                    "Только администраторы могут модерировать тейки.",
+                    show_alert=True
+                )
+                return
+
+        except Exception:
+
+            await query.answer(
+                "Не удалось проверить права модератора.",
+                show_alert=True
+            )
+            return
+
+        # -------------------------------------------------
+        # ОДОБРЕНИЕ
+        # -------------------------------------------------
+
+        if action == "approve":
+
+            take["status"] = "approved"
+            take["state"] = "approved"
+
+            publication = make_publication_text(take)
+
+            await query.edit_message_text(
+                "✅ <b>ОДОБРЕНО</b>\n\n"
+                f"{publication}\n\n"
+                "Можно вручную публиковать в канале.",
                 parse_mode="HTML"
             )
 
-            del takes[take_id]
+            return
 
-            await query.answer("Опубликовано!")
+        # -------------------------------------------------
+        # ОТКЛОНЕНИЕ
+        # -------------------------------------------------
+
+        if action == "reject":
+
+            take["status"] = "rejected"
+            take["state"] = "rejected"
+
+            publication = make_publication_text(take)
 
             await query.edit_message_text(
-                f"✅ <b>Тейк #{take_id} опубликован.</b>\n\n"
+                "❌ <b>ОТКЛОНЕНО</b>\n\n"
                 f"{publication}",
                 parse_mode="HTML"
             )
 
-        except Exception as error:
+            return
 
-            await query.answer(
-                "Не удалось опубликовать.",
-                show_alert=True
-            )
 
-            await query.message.reply_text(
-                f"Ошибка публикации:\n{error}"
-            )
+# =========================================================
+# ERROR HANDLER
+# =========================================================
 
-        return
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    # =====================================================
-    # ОТКЛОНИТЬ
-    # =====================================================
-
-    if action == "reject":
-
-        del takes[take_id]
-
-        await query.answer("Отклонено.")
-
-        await query.edit_message_text(
-            f"❌ <b>Тейк #{take_id} отклонён.</b>",
-            parse_mode="HTML"
-        )
-
-        return
+    logging.exception(
+        "Ошибка во время обработки обновления:",
+        exc_info=context.error
+    )
 
 
 # =========================================================
@@ -1035,30 +1279,49 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Команды
     app.add_handler(
         CommandHandler("start", start)
     )
 
     app.add_handler(
-        CallbackQueryHandler(button_handler)
+        CommandHandler("cancel", cancel_command)
     )
-app.add_handler(
-    CommandHandler("start", start)
-)
 
-app.add_handler(
-    CommandHandler("id", chat_id)
-)
+    # Команда для получения ID любого чата
+    app.add_handler(
+        CommandHandler("id", chat_id)
+    )
+
+    # Текст
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            receive_take
+            receive_text
         )
     )
 
+    # Фотографии
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            receive_photo
+        )
+    )
+
+    # Кнопки
+    app.add_handler(
+        CallbackQueryHandler(callbacks)
+    )
+
+    # Ошибки
+    app.add_error_handler(error_handler)
+
     print("🤖 Бот запущен!")
 
-    app.run_polling()
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
