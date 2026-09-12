@@ -18,12 +18,14 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# Твой Telegram ID
-MODERATOR_ID = 6708600693
+# Чат, куда будут приходить тейки на модерацию
+MODERATION_CHAT_ID = os.environ.get("MODERATION_CHAT_ID", "")
 
-# ID КФ пока можно оставить пустым.
-# Позже добавим его в настройках хостинга.
+# Чат, куда публикуются одобренные тейки
 CHAT_ID = os.environ.get("CHAT_ID", "")
+
+# Подпись после хэштегов
+BOT_SIGNATURE = "| @uslujestvokfbot"
 
 
 # =========================================================
@@ -58,7 +60,7 @@ HASHTAGS = [
 
 
 # =========================================================
-# КЛЮЧЕВЫЕ СЛОВА ДЛЯ АВТОПОДБОРА
+# КЛЮЧЕВЫЕ СЛОВА
 # =========================================================
 
 TAG_WORDS = {
@@ -102,6 +104,370 @@ TAG_WORDS = {
         "баннер", "баннеры", "шапка",
         "шапки", "реклама", "рекламный баннер",
     ],
+
+    "#сигны": [
+        "сигн", "сигны", "подпись",
+        "подписи", "sign", "signs",
+    ],
+
+    "#нфт": [
+        "nft", "нфт", "токен", "токены",
+    ],
+
+    "#адопты": [
+        "адопт", "адопты", "adopt", "adopts",
+        "персонаж на усыновление",
+    ],
+
+    "#эдиты": [
+        "эдит", "эдиты", "edit", "edits",
+        "монтаж", "монтажи", "видео монтаж",
+    ],
+
+    "#прокачки": [
+        "прокачка", "прокачки", "прокачаю",
+        "прокачать", "фарм", "фарма",
+    ],
+
+    "#игры": [
+        "игра", "игры", "игровой",
+        "игровые", "minecraft", "геншин",
+        "genshin", "roblox",
+    ],
+
+    "#оформления": [
+        "оформление", "оформления", "оформлю",
+        "дизайн", "дизайны", "профильное оформление",
+    ],
+
+    "#писательство": [
+        "писательство", "пишу", "напишу",
+        "тексты", "текст", "статья",
+        "статьи", "фанфик", "фанфики",
+    ],
+
+    "#репетиторство": [
+        "репетитор", "репетиторство", "уроки",
+        "занятия", "обучу", "обучение",
+        "преподаю",
+    ],
+
+    "#админство": [
+        "админ", "админы", "админство",
+        "администратор", "администраторы",
+        "модератор", "модераторы",
+        "модерация",
+    ],
+
+    "#учёба": [
+        "учёба", "учеба", "учусь",
+        "домашка", "домашнее задание",
+        "студент", "студенты",
+    ],
+
+    "#одежда": [
+        "одежда", "одежду", "одежды",
+        "футболка", "футболки", "худи",
+        "штаны", "платье",
+    ],
+
+    "#рукоделие": [
+        "рукоделие", "ручная работа",
+        "сделаю руками", "вязание", "шитьё",
+        "шитье", "вышивка", "лепка",
+        "украшения ручной работы",
+    ],
+
+    "#пиар": [
+        "пиар", "реклама", "рекламу",
+        "продвижение", "продвину",
+        "рекламировать", "раскрутка",
+    ],
+
+    "#бусты": [
+        "буст", "бусты", "бустинг",
+        "поднять уровень", "подниму уровень",
+    ],
+}
+
+
+# =========================================================
+# ХРАНИЛИЩЕ
+# =========================================================
+
+takes = {}
+take_counter = 0
+
+
+# =========================================================
+# ПОДБОР ХЭШТЕГОВ
+# =========================================================
+
+def suggest_hashtags(text):
+    text_lower = text.lower()
+    suggestions = []
+
+    for tag, words in TAG_WORDS.items():
+        for word in words:
+            if word in text_lower:
+                suggestions.append(tag)
+                break
+
+    return suggestions
+
+
+# =========================================================
+# ФИНАЛЬНЫЙ ТЕКСТ
+# =========================================================
+
+def make_publication_text(take):
+    text = html.escape(take["text"])
+    hashtags = " ".join(take["hashtags"])
+
+    parts = []
+
+    if text:
+        parts.append(text)
+
+    if hashtags:
+        parts.append(hashtags)
+
+    parts.append(html.escape(BOT_SIGNATURE))
+
+    return "\n\n".join(parts)
+
+
+# =========================================================
+# АВТОР
+# =========================================================
+
+def make_author_link(take):
+    name = take["full_name"]
+
+    return (
+        f'<a href="tg://user?id={take["user_id"]}">'
+        f'{html.escape(name)}'
+        f'</a>'
+    )
+
+
+# =========================================================
+# КЛАВИАТУРА ХЭШТЕГОВ
+# =========================================================
+
+def hashtag_keyboard(take_id):
+
+    take = takes[take_id]
+    selected = take["hashtags"]
+
+    buttons = []
+    row = []
+
+    for tag in HASHTAGS:
+
+        if tag in selected:
+            text = f"☑️ {tag}"
+        else:
+            text = f"☐ {tag}"
+
+        row.append(
+            InlineKeyboardButton(
+                text,
+                callback_data=f"tag:{take_id}:{tag}"
+            )
+        )
+
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
+    buttons.append([
+        InlineKeyboardButton(
+            "✅ Готово",
+            callback_data=f"done:{take_id}"
+        )
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+# =========================================================
+# КНОПКИ
+# =========================================================
+
+def preview_keyboard(take_id):
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✏️ Изменить хэштеги",
+                callback_data=f"edit:{take_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📨 Отправить на модерацию",
+                callback_data=f"send:{take_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Отменить",
+                callback_data=f"cancel:{take_id}"
+            )
+        ]
+    ])
+
+
+def moderation_keyboard(take_id):
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ ОПУБЛИКОВАТЬ",
+                callback_data=f"approve:{take_id}"
+            ),
+            InlineKeyboardButton(
+                "❌ ОТКЛОНИТЬ",
+                callback_data=f"reject:{take_id}"
+            )
+        ]
+    ])
+
+
+# =========================================================
+# ПРЕДПРОСМОТР
+# =========================================================
+
+def make_preview(take_id):
+
+    take = takes[take_id]
+
+    publication = make_publication_text(take)
+
+    return (
+        "👀 <b>Предпросмотр тейка:</b>\n\n"
+        f"{publication}"
+    )
+
+
+# =========================================================
+# START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        "Привет!\n\n"
+        "Это бот для тейков. Сюда можно отправить "
+        "текст или фотографию с подписью.\n\n"
+        "После этого выберите хэштеги и отправьте тейк "
+        "на модерацию.\n\n"
+        "Публикация осуществляется в течение 24 часов."
+    )
+
+
+# =========================================================
+# СОЗДАНИЕ ТЕЙКА
+# =========================================================
+
+def create_take(update, text, photo_id=None):
+
+    global take_counter
+
+    take_counter += 1
+    take_id = take_counter
+
+    user = update.effective_user
+
+    suggestions = suggest_hashtags(text)
+
+    takes[take_id] = {
+        "text": text,
+        "hashtags": suggestions,
+        "user_id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "photo_id": photo_id,
+    }
+
+    return take_id, suggestions
+
+
+# =========================================================
+# ТЕКСТОВЫЙ ТЕЙК
+# =========================================================
+
+async def receive_text_take(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
+
+    if len(text) < 2:
+        await update.message.reply_text(
+            "Тейк слишком короткий 😭"
+        )
+        return
+
+    if len(text) > 4000:
+        await update.message.reply_text(
+            "Тейк слишком длинный. Максимум 4000 символов."
+        )
+        return
+
+    take_id, suggestions = create_take(
+        update,
+        text
+    )
+
+    if suggestions:
+        message = (
+            "Я автоматически подобрал хэштеги.\n"
+            "Можешь убрать или добавить нужные:"
+        )
+    else:
+        message = (
+            "Выбери подходящие хэштеги для тейка:"
+        )
+
+    await update.message.reply_text(
+        message,
+        reply_markup=hashtag_keyboard(take_id)
+    )
+
+
+# =========================================================
+# ФОТО
+# =========================================================
+
+async def receive_photo_take(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message or not update.message.photo:
+        return
+
+    photo = update.message.photo[-1]
+
+    caption = (
+        update.message.caption.strip()
+        if update.message.caption
+        else ""
+    )
+
+    if len(caption) > 4000:
+        await update.message.reply_text(
+            "Подпись к фотографии слишком длинная. "
+            "Максимум     ],
 
     "#сигны": [
         "сигн", "сигны", "подпись",
